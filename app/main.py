@@ -37,11 +37,36 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
     }
     hits: dict[str, deque] = defaultdict(deque)
 
+    ka = {"enabled": bool(st.keep_alive_url), "last_ok": None, "last_error": None, "pings": 0}
+
+    async def keep_alive_loop(http: httpx.AsyncClient) -> None:
+        """ينادي /health عبر الرابط العام كل فترة: الطلب يمرّ من وكيل Render فيُحتسب نشاطاً واردًا."""
+        url = f"{st.keep_alive_url}/health"
+        await asyncio.sleep(30)   # مهلة لاكتمال الإقلاع
+        while True:
+            try:
+                r = await http.get(url, timeout=15)
+                ka["pings"] += 1
+                if r.status_code < 500:
+                    ka["last_ok"], ka["last_error"] = time.time(), None
+                else:
+                    ka["last_error"] = f"http {r.status_code}"
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # لا نُسقط الحلقة بسبب عطل عابر
+                ka["last_error"] = type(e).__name__
+                log.warning("keep-alive ping failed: %s", e)
+            await asyncio.sleep(st.keep_alive_interval)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.http = httpx.AsyncClient(timeout=20, transport=transport,
                                            headers={"User-Agent": st.user_agent})
+        task = asyncio.create_task(keep_alive_loop(app.state.http)) if st.keep_alive_url else None
         yield
+        if task:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         await app.state.http.aclose()
 
     app = FastAPI(title="Subtitle aggregator", lifespan=lifespan)
@@ -66,6 +91,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
     @app.get("/health")
     async def health():
         return {"ok": True, "tmdb": bool(st.tmdb_key), "scraping": st.enable_scraping,
+                "keep_alive": ka,
                 "pools": {k: v.status() for k, v in pools.items()}}
 
     # ————— البحث —————

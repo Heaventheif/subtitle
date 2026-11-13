@@ -19,3 +19,6 @@ services:
         value: "0"
       - key: FIRECRAWL_KEYS
         sync: false
+      # RENDER_EXTERNAL_URL يحقنه Render تلقائياً ويُستخدم للنبض الذاتي؛ هذا اختياري
+      - key: KEEP_ALIVE_INTERVAL
+        value: "600"

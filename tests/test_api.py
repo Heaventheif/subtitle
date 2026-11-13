@@ -76,3 +76,32 @@ def test_auth():
     with TestClient(create_app(st, make_transport(state))) as c:
         assert c.get("/search?q=x").status_code == 401
         assert c.get("/health").status_code == 200
+
+
+def test_keep_alive_pings_health(monkeypatch):
+    import asyncio
+    hits = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        hits.append(str(req.url))
+        return httpx.Response(200, json={"ok": True})
+
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(_):
+        await real_sleep(0.01)
+
+    monkeypatch.setattr("app.main.asyncio.sleep", fast_sleep)
+    st = Settings(app_token="tok", db_path=":memory:", keep_alive_url="https://x.onrender.com",
+                  keep_alive_interval=60)
+    with TestClient(create_app(st, httpx.MockTransport(handler))) as c:
+        import time
+        time.sleep(0.3)
+        info = c.get("/health").json()["keep_alive"]
+    assert hits and all(u == "https://x.onrender.com/health" for u in hits)
+    assert info["enabled"] and info["pings"] >= 1 and info["last_ok"]
+
+
+def test_keep_alive_disabled_by_default():
+    c = TestClient(create_app(Settings(db_path=":memory:"), httpx.MockTransport(lambda r: httpx.Response(404))))
+    assert c.get("/health").json()["keep_alive"]["enabled"] is False

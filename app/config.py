@@ -37,6 +37,9 @@ class Settings:
     search_cache_hours: int = 24
     rate_limit_per_min: int = 60
     user_agent: str = "MediaPlayerSubs/1.0"
+    # إبقاء الخادم مستيقظاً على Render المجاني (ينام بعد ~15 دقيقة بلا طلبات واردة)
+    keep_alive_url: str = ""          # فارغ = معطّل (محلياً وفي الاختبارات)
+    keep_alive_interval: int = 600    # ثوانٍ؛ أقل من 15 دقيقة بهامش أمان
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -52,4 +55,7 @@ class Settings:
             enable_scraping=os.getenv("ENABLE_SCRAPING", "0") == "1",
             db_path=os.getenv("DB_PATH", "data/cache.db"),
             search_cache_hours=int(os.getenv("SEARCH_CACHE_HOURS", "24")),
+            # Render يحقن RENDER_EXTERNAL_URL تلقائياً؛ KEEP_ALIVE_URL لتجاوزه يدوياً
+            keep_alive_url=(os.getenv("KEEP_ALIVE_URL") or os.getenv("RENDER_EXTERNAL_URL", "")).rstrip("/"),
+            keep_alive_interval=max(60, int(os.getenv("KEEP_ALIVE_INTERVAL", "600"))),
         )
