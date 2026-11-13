@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: subtitle-aggregator
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: APP_TOKEN
+        generateValue: true
+      - key: TMDB_API_KEY
+        sync: false
+      - key: WYZIE_KEYS
+        sync: false
+      - key: OPENSUBTITLES_ACCOUNTS
+        sync: false
+      - key: SUBDL_API_KEYS
+        sync: false
+      - key: ENABLE_SCRAPING
+        value: "0"
+      - key: FIRECRAWL_KEYS
+        sync: false
