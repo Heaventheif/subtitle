@@ -1,4 +1,4 @@
-"""الخادم الوسيط الهجيني للترجمات: Tier1 (Wyzie + OpenSubtitles) ثم Tier2 (SubDL + كشط) مع كاش."""
+"""الخادم الوسيط الهجيني للترجمات: Tier1 + Tier2 + ترجمة عربية آلية عبر Gemini/Groq."""
 from __future__ import annotations
 
 import asyncio
@@ -10,10 +10,10 @@ from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
-from . import ranking, textfix, tmdb
+from . import ai, ranking, textfix, tmdb
 from .config import Settings
 from .db import Db
 from .keypool import KeyPool, NoKeyAvailable, ProviderHTTPError
@@ -34,15 +34,21 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         "osub": KeyPool("opensubtitles", [osub.pack_account(a) for a in st.os_accounts], st.os_daily_limit, db),
         "subdl": KeyPool("subdl", st.subdl_keys, st.subdl_daily_limit, db),
         "fc": KeyPool("firecrawl", st.firecrawl_keys, 500, db),
+        "gemini": KeyPool("gemini", st.gemini_keys, st.gemini_daily_limit, db),
+        "groq": KeyPool("groq", st.groq_keys, st.groq_daily_limit, db),
     }
     hits: dict[str, deque] = defaultdict(deque)
+
+    # قفل يمنع أكثر من ترجمة واحدة في نفس الوقت (حسب الخطة)
+    translate_lock = asyncio.Lock()
+    # منع تكرار طلبات الفيديو نفسه أثناء المعالجة
+    in_flight: dict[str, asyncio.Future] = {}
 
     ka = {"enabled": bool(st.keep_alive_url), "last_ok": None, "last_error": None, "pings": 0}
 
     async def keep_alive_loop(http: httpx.AsyncClient) -> None:
-        """ينادي /health عبر الرابط العام كل فترة: الطلب يمرّ من وكيل Render فيُحتسب نشاطاً واردًا."""
         url = f"{st.keep_alive_url}/health"
-        await asyncio.sleep(30)   # مهلة لاكتمال الإقلاع
+        await asyncio.sleep(30)
         while True:
             try:
                 r = await http.get(url, timeout=15)
@@ -53,15 +59,18 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                     ka["last_error"] = f"http {r.status_code}"
             except asyncio.CancelledError:
                 raise
-            except Exception as e:  # لا نُسقط الحلقة بسبب عطل عابر
+            except Exception as e:
                 ka["last_error"] = type(e).__name__
                 log.warning("keep-alive ping failed: %s", e)
             await asyncio.sleep(st.keep_alive_interval)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.http = httpx.AsyncClient(timeout=20, transport=transport,
-                                           headers={"User-Agent": st.user_agent})
+        app.state.http = httpx.AsyncClient(
+            timeout=90,  # أطول بسبب الترجمة
+            transport=transport,
+            headers={"User-Agent": st.user_agent},
+        )
         task = asyncio.create_task(keep_alive_loop(app.state.http)) if st.keep_alive_url else None
         yield
         if task:
@@ -90,11 +99,17 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
 
     @app.get("/health")
     async def health():
-        return {"ok": True, "tmdb": bool(st.tmdb_key), "scraping": st.enable_scraping,
-                "keep_alive": ka,
-                "pools": {k: v.status() for k, v in pools.items()}}
+        return {
+            "ok": True,
+            "tmdb": bool(st.tmdb_key),
+            "scraping": st.enable_scraping,
+            "ai_translate": st.enable_ai_translate and bool(pools["gemini"] or pools["groq"]),
+            "ai_title_clean": st.enable_ai_title_clean and bool(pools["gemini"] or pools["groq"]),
+            "keep_alive": ka,
+            "pools": {k: v.status() for k, v in pools.items()},
+        }
 
-    # ————— البحث —————
+    # ————— أدوات مساعدة —————
 
     def _store(c: Candidate) -> str:
         uid = hashlib.sha1(f"{c.provider}|{c.ref}".encode()).hexdigest()[:16]
@@ -109,9 +124,11 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         return uid
 
     def _from_row(r) -> Candidate:
-        return Candidate(provider=r["provider"], ref=r["ref"], lang=r["lang"] or "", release=r["release"] or "",
-                         rating=r["rating"], downloads=r["downloads"], fmt=r["fmt"] or "srt",
-                         hi=bool(r["hi"]), hash_match=bool(r["hash_match"]))
+        return Candidate(
+            provider=r["provider"], ref=r["ref"], lang=r["lang"] or "", release=r["release"] or "",
+            rating=r["rating"], downloads=r["downloads"], fmt=r["fmt"] or "srt",
+            hi=bool(r["hi"]), hash_match=bool(r["hash_match"]),
+        )
 
     async def _tier1(http, ids, parsed, langs, moviehash) -> list[Candidate]:
         jobs = []
@@ -151,24 +168,151 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                 out += res
         return out
 
+    async def _download_candidate(http, c: Candidate) -> tuple[bytes, str]:
+        """ينزّل محتوى الترجمة الخام."""
+        p, ref = c.provider, c.ref
+        if p == "wyzie":
+            data = await wyzie.download(http, ref)
+        elif p == "opensubtitles":
+            data = await pools["osub"].call(lambda k: osub.download(http, k, st.user_agent, ref))
+        elif p == "subdl":
+            data = await subdl.download(http, ref)
+        elif p == "yify":
+            data = await yify.download(http, ref)
+        else:
+            raise ValueError(f"unknown provider {p}")
+        blob, fmt, _enc = textfix.normalize_subtitle(data, c.lang or "en")
+        return blob, fmt
+
+    async def _try_ai_translate(http, ranked: list, parsed: dict) -> dict | None:
+        """
+        يختار أول نسخة غير عربية حسب الأولوية، يترجمها، ويعيد عنصر نتيجة AI.
+        يعيد None عند الفشل (حسب الخطة: لا نرسل ملفاً ناقصاً).
+        """
+        if not st.enable_ai_translate:
+            return None
+        if not (pools["gemini"] or pools["groq"]):
+            return None
+
+        # هل توجد عربية جيدة أصلاً؟
+        has_ar = any((c.lang or "").lower().startswith("ar") for c, _ in ranked[:10])
+        if has_ar:
+            # نترجم فقط إذا لم تكن هناك عربية — حسب الخطة نضيف AI حتى مع وجود عربية؟
+            # القرار النهائي: نترجم أول نسخة EN/FR... ونضعها في الأعلى كخيار إضافي
+            pass
+
+        source = ai.pick_source_candidate([c for c, _ in ranked])
+        if source is None:
+            return None
+
+        async with translate_lock:
+            try:
+                raw_blob, fmt = await _download_candidate(http, source)
+                text = raw_blob.decode("utf-8", errors="replace")
+                if fmt not in ("srt", "vtt"):
+                    # نحاول معاملة VTT كـ SRT بسيط
+                    pass
+
+                translated = await ai.translate_srt_to_arabic(
+                    http,
+                    pools["gemini"] if pools["gemini"] else None,
+                    pools["groq"] if pools["groq"] else None,
+                    text,
+                )
+                if not translated:
+                    return None
+
+                # تخزين الترجمة الآلية كملف جديد
+                ai_ref = f"ai:{source.provider}:{source.ref}"
+                uid = hashlib.sha1(ai_ref.encode()).hexdigest()[:16]
+                title = parsed.get("title") or "Unknown"
+                release = f"{title} — AR (AI)"
+                db.execute(
+                    "INSERT INTO subtitle_files(uid,provider,ref,lang,release,rating,downloads,fmt,hi,hash_match,blob,size,encoding,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(uid) DO UPDATE SET blob=excluded.blob, size=excluded.size",
+                    (uid, "ai", ai_ref, "ar", release, None, None, "srt", 0, 0,
+                     translated.encode("utf-8"), len(translated.encode("utf-8")), "utf-8", time.time()),
+                )
+                return {
+                    "id": uid,
+                    "source": "ai",
+                    "lang": "ar",
+                    "release": release,
+                    "match": 100,
+                    "rating": None,
+                    "downloads": None,
+                    "format": "srt",
+                    "hi": False,
+                    "ai": True,
+                    "from_lang": (source.lang or "")[:2],
+                }
+            except Exception as e:
+                log.warning("AI translate failed: %s", e)
+                return None
+
+    # ————— البحث —————
+
     @app.get("/search")
-    async def search(request: Request,
-                     filename: str = "", q: str = "", imdb_id: str = "", tmdb_id: int = 0,
-                     season: int = 0, episode: int = 0, lang: str = "ar", hash: str = "",
-                     refresh: bool = False):
+    async def search(
+        request: Request,
+        filename: str = "",
+        q: str = "",
+        imdb_id: str = "",
+        tmdb_id: int = 0,
+        season: int = 0,
+        episode: int = 0,
+        lang: str = "ar",
+        hash: str = "",
+        refresh: bool = False,
+        translate: bool = True,
+    ):
         http: httpx.AsyncClient = request.app.state.http
         langs = [x for x in dict.fromkeys(l.strip().lower() for l in lang.split(",")) if x] or ["ar"]
         if not (filename or q or imdb_id or tmdb_id):
             raise HTTPException(400, "filename or q required")
 
-        parsed = parse_filename(filename or q)
+        raw_input = filename or q
+        parsed = parse_filename(raw_input)
         if q and filename:
             m = parse_filename(q)
-            parsed.update(title=m["title"] or parsed["title"], year=m["year"], season=m["season"], episode=m["episode"])
+            parsed.update(
+                title=m["title"] or parsed["title"],
+                year=m["year"],
+                season=m["season"],
+                episode=m["episode"],
+            )
         if season and episode:
             parsed["season"], parsed["episode"] = season, episode
 
         ids: dict = {"imdb_id": imdb_id or None, "tmdb_id": tmdb_id or None}
+
+        # مفتاح منع التكرار
+        flight_key = hashlib.sha1(
+            json.dumps([ids, parsed["title"].lower(), parsed["year"], parsed["season"],
+                        parsed["episode"], langs, hash, translate], ensure_ascii=False).encode()
+        ).hexdigest()
+
+        # إذا كان نفس الطلب قيد المعالجة → انتظر نتيجته
+        if flight_key in in_flight:
+            return await in_flight[flight_key]
+
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future = loop.create_future()
+        in_flight[flight_key] = fut
+
+        try:
+            result = await _do_search(
+                http, parsed, ids, langs, hash, refresh, translate, raw_input
+            )
+            fut.set_result(result)
+            return result
+        except Exception as e:
+            fut.set_exception(e)
+            raise
+        finally:
+            in_flight.pop(flight_key, None)
+
+    async def _do_search(http, parsed, ids, langs, hash, refresh, translate, raw_input):
         ckey = hashlib.sha1(json.dumps(
             [ids, parsed["title"].lower(), parsed["year"], parsed["season"], parsed["episode"], langs, hash],
             ensure_ascii=False).encode()).hexdigest()
@@ -178,6 +322,8 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         tier = 1
         resolved = None
         uids: list[str]
+        ai_cleaned = False
+
         if cached:
             payload = json.loads(cached["payload"])
             uids, resolved, tier = payload["uids"], payload.get("resolved"), payload.get("tier", 1)
@@ -186,33 +332,91 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                 resolved = await tmdb.resolve(http, db, st.tmdb_key, parsed)
                 if resolved:
                     ids = {"imdb_id": resolved.get("imdb_id"), "tmdb_id": resolved.get("tmdb_id")}
+
+            # إذا فشل التعرف → تنظيف العنوان بـ Gemini
+            if not (ids.get("imdb_id") or ids.get("tmdb_id")) and st.enable_ai_title_clean:
+                cleaned = await ai.clean_title(
+                    http,
+                    pools["gemini"] if pools["gemini"] else None,
+                    pools["groq"] if pools["groq"] else None,
+                    raw_input,
+                )
+                if cleaned and cleaned.get("title"):
+                    ai_cleaned = True
+                    parsed["title"] = cleaned["title"]
+                    if cleaned.get("year"):
+                        parsed["year"] = cleaned["year"]
+                    if cleaned.get("season"):
+                        parsed["season"] = cleaned["season"]
+                    if cleaned.get("episode"):
+                        parsed["episode"] = cleaned["episode"]
+                    resolved = await tmdb.resolve(http, db, st.tmdb_key, parsed)
+                    if resolved:
+                        ids = {"imdb_id": resolved.get("imdb_id"), "tmdb_id": resolved.get("tmdb_id")}
+
             cands = await _tier1(http, ids, parsed, langs, hash or None)
-            want_ar = langs[0]
+            want_ar = langs[0] if langs else "ar"
             if not any(c.lang == want_ar for c in cands):
+                # نبحث أيضاً بالإنجليزية وبقية اللغات لتمكين الترجمة لاحقاً
+                extra_langs = list(dict.fromkeys(langs + ["en", "fr", "es", "pt", "ru", "tr"]))
                 tier = 2
-                cands += await _tier2(http, ids, parsed, langs)
+                cands += await _tier2(http, ids, parsed, extra_langs)
+                # إعادة tier1 بلغات إضافية إن لزم
+                more = await _tier1(http, ids, parsed, [l for l in extra_langs if l not in langs], hash or None)
+                cands += more
+
             seen, uniq = set(), []
             for c in cands:
                 if (c.provider, c.ref) not in seen:
                     seen.add((c.provider, c.ref))
                     uniq.append(c)
             uids = [_store(c) for c in uniq]
-            if uids:   # لا نخزّن النتائج الفارغة (قد تكون عطلاً عابراً)
-                db.execute("INSERT OR REPLACE INTO search_cache VALUES(?,?,?,?)",
-                           (ckey, json.dumps({"uids": uids, "resolved": resolved, "tier": tier}),
-                            time.time(), time.time() + st.search_cache_hours * 3600))
-            db.purge_expired()
+            if uids:
+                expires = time.time() + st.search_cache_hours * 3600
+                db.execute(
+                    "INSERT OR REPLACE INTO search_cache(query_hash,payload,created_at,expires_at) VALUES(?,?,?,?)",
+                    (ckey, json.dumps({"uids": uids, "resolved": resolved, "tier": tier}, ensure_ascii=False),
+                     time.time(), expires),
+                )
 
         rows = [r for r in (db.one("SELECT * FROM subtitle_files WHERE uid=?", (u,)) for u in uids) if r]
         ranked = ranking.rank([_from_row(r) for r in rows], parsed, langs)
         uid_of = {(r["provider"], r["ref"]): r["uid"] for r in rows}
+
         results = [{
-            "id": uid_of[(c.provider, c.ref)], "source": c.provider, "lang": c.lang, "release": c.release,
-            "match": sc, "rating": c.rating, "downloads": c.downloads, "format": c.fmt, "hi": c.hi,
+            "id": uid_of[(c.provider, c.ref)],
+            "source": c.provider,
+            "lang": c.lang,
+            "release": c.release,
+            "match": sc,
+            "rating": c.rating,
+            "downloads": c.downloads,
+            "format": c.fmt,
+            "hi": c.hi,
         } for c, sc in ranked[:30]]
-        return {"query": {"title": parsed["title"], "year": parsed["year"], "season": parsed["season"],
-                          "episode": parsed["episode"]},
-                "resolved": resolved, "cached": bool(cached), "tier": tier, "results": results}
+
+        # ── الترجمة الآلية (ننتظر اكتمالها ثم نرسل قائمة واحدة) ──
+        ai_result = None
+        if translate and st.enable_ai_translate:
+            ai_result = await _try_ai_translate(http, ranked, parsed)
+
+        if ai_result:
+            results.insert(0, ai_result)
+
+        return {
+            "query": {
+                "title": parsed["title"],
+                "year": parsed["year"],
+                "season": parsed["season"],
+                "episode": parsed["episode"],
+            },
+            "resolved": resolved,
+            "cached": bool(cached),
+            "tier": tier,
+            "ai_cleaned": ai_cleaned,
+            "ai_translated": bool(ai_result),
+            "results": results,
+        }
 
     # ————— الملف —————
 
@@ -226,6 +430,8 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         if blob is None:
             try:
                 p, ref = row["provider"], row["ref"]
+                if p == "ai":
+                    raise HTTPException(404, "ai subtitle missing blob")
                 if p == "wyzie":
                     data = await wyzie.download(http, ref)
                 elif p == "opensubtitles":
@@ -243,11 +449,14 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                 raise HTTPException(502, f"provider error {e.status}")
             except (ValueError, KeyError) as e:
                 raise HTTPException(502, f"bad subtitle: {e}")
-            db.execute("UPDATE subtitle_files SET blob=?, size=?, encoding=?, fmt=? WHERE uid=?",
-                       (blob, len(blob), enc, fmt, uid))
-        return Response(content=blob, media_type="text/plain; charset=utf-8",
-                        headers={"X-Subtitle-Format": fmt, "X-Subtitle-Lang": row["lang"] or ""})
+            db.execute(
+                "UPDATE subtitle_files SET blob=?, size=?, encoding=?, fmt=? WHERE uid=?",
+                (blob, len(blob), enc, fmt, uid),
+            )
+        return Response(
+            content=blob,
+            media_type="text/plain; charset=utf-8",
+            headers={"X-Subtitle-Format": fmt, "X-Subtitle-Lang": row["lang"] or ""},
+        )
 
     return app
-
-

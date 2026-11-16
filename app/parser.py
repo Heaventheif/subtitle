@@ -9,7 +9,15 @@ _YEAR = re.compile(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)")
 _RES = re.compile(r"(?i)\b(480p|576p|720p|1080p|1440p|2160p|4k|uhd)\b")
 _SRC = re.compile(r"(?i)\b(web-?dl|web-?rip|webrip|blu-?ray|bdrip|brrip|hdrip|dvdrip|hdtv|remux|hdcam|cam|amzn|nf|dsnp|hmax)\b")
 _CODEC = re.compile(r"(?i)\b(x264|x265|h\.?264|h\.?265|hevc|avc|av1|xvid|10bit|hdr|aac|ac3|dts|ddp5?\.?1?|atmos)\b")
-_JUNK = re.compile(r"(?i)\b(proper|repack|extended|unrated|internal|multi|dual|dubbed|arabic|subbed|yify|yts|rarbg)\b")
+_JUNK = re.compile(
+    r"(?i)\b("
+    r"proper|repack|extended|unrated|internal|multi|dual|dubbed|arabic|subbed|"
+    r"yify|yts|rarbg|ettv|eztv|rartv|sparks|geckos|ctrlhd|dimension|killers|"
+    r"official|trailer|sample|softsub|hardsub"
+    r")\b"
+)
+# رموز وعلامات تجارية شائعة
+_SYMBOLS = re.compile(r"[™®©]+")
 
 
 def parse_filename(name: str) -> dict:
@@ -19,7 +27,8 @@ def parse_filename(name: str) -> dict:
     m = re.search(r"-([A-Za-z0-9]{2,12})$", base)
     if m:
         release_group = m.group(1).lower()
-    text = re.sub(r"[\[\]\(\)\{\}]", " ", base)
+    text = _SYMBOLS.sub(" ", base)
+    text = re.sub(r"[\[\]\(\)\{\}]", " ", text)
     text = re.sub(r"[._]+", " ", text)
 
     season = episode = None
@@ -43,7 +52,7 @@ def parse_filename(name: str) -> dict:
             cut = min(cut, mm.start())
 
     title = _JUNK.sub(" ", text[:cut])
-    title = re.sub(r"\s+", " ", title).strip(" -")
+    title = re.sub(r"\s+", " ", title).strip(" -_")
 
     tokens: set[str] = set()
     for rx in (_RES, _SRC, _CODEC):
