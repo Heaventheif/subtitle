@@ -1,0 +1,4 @@
+subtitle-server
+data/
+*.db
+.env

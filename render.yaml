@@ -1,24 +1,25 @@
 services:
   - type: web
-    name: subtitle-aggregator
+    name: subtitle-server
     runtime: docker
     plan: free
     healthCheckPath: /health
     envVars:
       - key: APP_TOKEN
         generateValue: true
-      - key: TMDB_API_KEY
-        sync: false
-      - key: WYZIE_KEYS
-        sync: false
       - key: OPENSUBTITLES_ACCOUNTS
         sync: false
+      - key: OPENSUBTITLES_DAILY_LIMIT
+        value: "200"
       - key: SUBDL_API_KEYS
         sync: false
-      - key: ENABLE_SCRAPING
-        value: "0"
-      - key: FIRECRAWL_KEYS
-        sync: false
-      # RENDER_EXTERNAL_URL يحقنه Render تلقائياً ويُستخدم للنبض الذاتي؛ هذا اختياري
-      - key: KEEP_ALIVE_INTERVAL
-        value: "600"
+      - key: SUBDL_DAILY_LIMIT
+        value: "500"
+      # مهلة البحث الصارمة (ms) — الرد الجزئي أفضل من الرد البطيء
+      - key: SEARCH_TIMEOUT_MS
+        value: "6000"
+      - key: DB_PATH
+        value: "data/cache.db"
+      # RENDER_EXTERNAL_URL يحقنه Render تلقائياً ويُستخدم للنبض الذاتي
+      - key: KEEP_ALIVE_INTERVAL_MS
+        value: "600000"
