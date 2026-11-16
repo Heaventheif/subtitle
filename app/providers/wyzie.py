@@ -12,18 +12,18 @@ BASE = "https://sub.wyzie.io/search"
 def _raise(r: httpx.Response) -> None:
     if r.status_code >= 400:
         ra = r.headers.get("Retry-After")
-        raise ProviderHTTPError(r.status_code, r.text[:120], float(ra) if ra and ra.isdigit() else None)
+        raise ProviderHTTPError(r.status_code, r.text[:300], float(ra) if ra and ra.isdigit() else None)
 
 
 async def search(http: httpx.AsyncClient, key: str, *, tmdb_id: int | None, imdb_id: str | None,
                  season: int | None, episode: int | None, lang: str, filename: str = "") -> list[Candidate]:
-    params: dict = {"key": key, "language": lang}
-    if tmdb_id:
-        params["tmdb_id"] = tmdb_id
-    elif imdb_id:
-        params["id"] = imdb_id
-    else:
+    # الـ API الحالي يتطلب البارامتر `id` فقط (IMDb مثل tt1234567 أو رقم TMDB).
+    # إرسال tmdb_id كان يسبب: HTTP 400 "No id parameter was provided".
+    # نفضّل IMDb لأنه أسرع (TMDB يتطلب تحويلاً داخلياً عندهم).
+    media_id = imdb_id or tmdb_id
+    if not media_id:
         return []
+    params: dict = {"key": key, "language": lang, "id": media_id}
     if season and episode:
         params["season"], params["episode"] = season, episode
     r = await http.get(BASE, params=params)

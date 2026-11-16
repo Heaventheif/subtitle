@@ -107,7 +107,17 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             "ai_title_clean": st.enable_ai_title_clean and bool(pools["gemini"] or pools["groq"]),
             "keep_alive": ka,
             "pools": {k: v.status() for k, v in pools.items()},
+            "ai_models": ai.models_status(),
         }
+
+    @app.get("/ai/selftest")
+    async def ai_selftest(request: Request):
+        """فحص حيّ لـ Gemini وGroq (محمي بـ X-App-Token). يستهلك طلباً صغيراً لكل مزوّد."""
+        return await ai.selftest(
+            request.app.state.http,
+            pools["gemini"] if pools["gemini"] else None,
+            pools["groq"] if pools["groq"] else None,
+        )
 
     # ————— أدوات مساعدة —————
 
@@ -218,6 +228,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                     pools["gemini"] if pools["gemini"] else None,
                     pools["groq"] if pools["groq"] else None,
                     text,
+                    title=parsed.get("title") or "",
                 )
                 if not translated:
                     return None
