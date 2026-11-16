@@ -146,11 +146,24 @@ func (s *Store) PutMeta(f *SubtitleFile) {
 	})
 }
 
-func (s *Store) PutCandidate(c *Candidate) {
-	s.PutMeta(&SubtitleFile{
-		UID: c.UID, Provider: c.Provider, Ref: c.Ref, Lang: c.Lang, Release: c.Release,
-		Rating: c.Rating, Downloads: c.Downloads, Fmt: c.Format, Hi: c.Hi,
-		HashMatch: c.HashMatch, Fps: c.Fps,
+// PutCandidates stores all candidates in ONE transaction (one fsync).
+func (s *Store) PutCandidates(cs []*Candidate) {
+	if len(cs) == 0 {
+		return
+	}
+	s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bktMeta)
+		for _, c := range cs {
+			raw, _ := json.Marshal(&SubtitleFile{
+				UID: c.UID, Provider: c.Provider, Ref: c.Ref, Lang: c.Lang, Release: c.Release,
+				Rating: c.Rating, Downloads: c.Downloads, Fmt: c.Format, Hi: c.Hi,
+				HashMatch: c.HashMatch, Fps: c.Fps,
+			})
+			if err := b.Put([]byte(c.UID), raw); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }
 
@@ -173,11 +186,18 @@ func (s *Store) PurgeExpired() {
 	cut := time.Now().UnixMilli()
 	s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bktSearch)
+		// collect first, delete after: deleting while iterating skips keys in bbolt
+		var dead [][]byte
 		c := b.Cursor()
 		for k, v := c.First(); k != nil; k, v = c.Next() {
 			var e searchCacheEntry
 			if json.Unmarshal(v, &e) != nil || e.Expires < cut {
-				b.Delete(k)
+				dead = append(dead, append([]byte(nil), k...))
+			}
+		}
+		for _, k := range dead {
+			if err := b.Delete(k); err != nil {
+				return err
 			}
 		}
 		return nil
@@ -220,7 +240,7 @@ func (h *HotCache) Get(k string) (*SearchResponse, bool) {
 
 func (h *HotCache) Set(k string, resp SearchResponse, ttl time.Duration) {
 	h.mu.Lock()
-	if len(h.m) >= h.max { // إزالة الأقدم (الإدراج الأول)
+	if len(h.m) >= h.max { // evict an arbitrary entry (not true LRU)
 		for key := range h.m {
 			delete(h.m, key)
 			break

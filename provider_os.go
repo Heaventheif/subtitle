@@ -17,7 +17,9 @@ import (
 var osLangMap = map[string]string{
 	"ara": "ar", "arabic": "ar", "eng": "en", "english": "en", "fre": "fr",
 	"french": "fr", "spa": "es", "spanish": "es", "tur": "tr", "turkish": "tr",
-	"per": "fa", "persian": "fa",
+	"per": "fa", "persian": "fa", "german": "de", "ger": "de", "portuguese": "pt",
+	"por": "pt", "chinese": "zh", "chi": "zh", "dutch": "nl", "russian": "ru",
+	"japanese": "ja", "korean": "ko", "italian": "it", "hebrew": "he", "indonesian": "id",
 }
 
 func normLang(v string) string {
@@ -87,6 +89,12 @@ func retryAfter(v string) float64 {
 		return n
 	}
 	return 0
+}
+
+func (c *osClient) forgetToken(acc OSAccount) {
+	c.mu.Lock()
+	delete(c.tokens, acc.APIKey+"|"+acc.Username+"|"+acc.Password)
+	c.mu.Unlock()
 }
 
 func (c *osClient) loginToken(ctx context.Context, acc OSAccount) (string, error) {
@@ -267,6 +275,9 @@ func (c *osClient) Download(ctx context.Context, acc OSAccount, fileID string) (
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	resp.Body.Close()
 	if resp.StatusCode >= 400 {
+		if resp.StatusCode == 401 {
+			c.forgetToken(acc) // stale token: force fresh login next time
+		}
 		return nil, &ProviderHTTPError{Status: resp.StatusCode, Message: string(body[:min(120, len(body))])}
 	}
 	var out struct {

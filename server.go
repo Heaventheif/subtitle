@@ -203,8 +203,12 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 }
 
 func clientIP(r *http.Request) string {
+	// the LAST entry is the one appended by our own proxy (Render); earlier ones are client-controlled
 	if xf := r.Header.Get("X-Forwarded-For"); xf != "" {
-		return strings.TrimSpace(strings.Split(xf, ",")[0])
+		parts := strings.Split(xf, ",")
+		if ip := strings.TrimSpace(parts[len(parts)-1]); ip != "" {
+			return ip
+		}
 	}
 	// RemoteAddr يأتي "ip:port" — نأخذ IP فقط (نفس سلوك socket.remoteAddress)
 	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
@@ -232,8 +236,12 @@ func (s *Server) rateOk(ip string) bool {
 	}
 	q = append(q, now)
 	s.hits[ip] = q
-	if len(s.hits) > 5000 {
-		s.hits = map[string][]int64{}
+	if len(s.hits) > 5000 { // sweep only stale IPs; never reset everyone's counters
+		for k, v := range s.hits {
+			if len(v) == 0 || v[len(v)-1] < win {
+				delete(s.hits, k)
+			}
+		}
 	}
 	return true
 }
@@ -265,7 +273,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	lang := normalizeLangs(q.Get("lang"))
 	filename := q.Get("filename")
 	manual := strings.TrimSpace(q.Get("q"))
-	hash := q.Get("hash")
+	hash := strings.ToLower(strings.TrimSpace(q.Get("hash")))
 	if !hashRx.MatchString(hash) {
 		hash = ""
 	}
@@ -308,11 +316,13 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 
 	// مفتاح الكاش حسب بروتوكول v2 §6: البصمة إن وُجدت وإلا الاسم+q+اللغات
 	slangKey := sortedKeys(slangs)
+	// every input that changes the upstream query must be part of the key
+	ids := fmt.Sprintf("%s|%s|%d|%d", imdbID, tmdbID, parseInt(q.Get("season")), parseInt(q.Get("episode")))
 	ckey := ""
 	if hash != "" {
-		ckey = fmt.Sprintf("h:%s:%s:%s:%s", hash, strings.Join(lang, ","), manual, slangKey)
+		ckey = fmt.Sprintf("h:%s:%s:%s:%s:%s", hash, strings.Join(lang, ","), manual, slangKey, ids)
 	} else {
-		sum := sha1.Sum([]byte(filename + "|" + manual + "|" + strings.Join(lang, ",") + "|" + slangKey))
+		sum := sha1.Sum([]byte(filename + "|" + manual + "|" + strings.Join(lang, ",") + "|" + slangKey + "|" + ids))
 		ckey = "n:" + hex.EncodeToString(sum[:])
 	}
 
@@ -382,7 +392,7 @@ func (s *Server) flightDo(ckey string, parsed Parsed, lang []string, hash string
 func (s *Server) searchFlow(ckey string, parsed Parsed, lang []string, hash string,
 	slangs map[string]bool, videoFps *float64, imdbID, tmdbID string) (SearchResponse, error) {
 
-	cands, err := s.searchUpstream(parsed, lang, hash, imdbID, tmdbID)
+	cands, partial, err := s.searchUpstream(parsed, lang, hash, imdbID, tmdbID)
 	if err != nil {
 		return SearchResponse{}, err
 	}
@@ -432,13 +442,16 @@ func (s *Server) searchFlow(ckey string, parsed Parsed, lang []string, hash stri
 	if len(resp.Results) == 0 {
 		ttl, hotTTL = s.cfg.NegCacheTTL, time.Minute
 	}
+	if partial { // a provider failed: don't pin an incomplete answer for days
+		ttl, hotTTL = 2*time.Minute, 30*time.Second
+	}
 	s.store.PutSearch(ckey, resp, ttl)
 	s.hot.Set(ckey, resp, hotTTL)
 	return resp, nil
 }
 
 // searchUpstream الطلبات المتوازية للمزوّدين (بصمة + اسم + SubDL) ضمن مهلة صارمة.
-func (s *Server) searchUpstream(parsed Parsed, lang []string, hash, imdbID, tmdbID string) ([]*Candidate, error) {
+func (s *Server) searchUpstream(parsed Parsed, lang []string, hash, imdbID, tmdbID string) ([]*Candidate, bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.SearchTimeout)
 	defer cancel()
 	langStr := strings.Join(lang, ",")
@@ -509,12 +522,11 @@ func (s *Server) searchUpstream(parsed Parsed, lang []string, hash, imdbID, tmdb
 	for _, e := range errs {
 		if _, ok := e.(*NoKeyAvailable); !ok {
 			allNoKey = false
-		} else {
-			log.Printf("[provider] %v", e)
 		}
+		log.Printf("[provider] %v", e) // log every provider failure
 	}
 	if len(cands) == 0 && allNoKey {
-		return nil, errs[0]
+		return nil, true, errs[0]
 	}
 
 	// دمج + إزالة التكرار (نفس المزوّد والمرجع)
@@ -528,10 +540,8 @@ func (s *Server) searchUpstream(parsed Parsed, lang []string, hash, imdbID, tmdb
 		seen[k] = true
 		uniq = append(uniq, c)
 	}
-	for _, c := range uniq {
-		s.store.PutCandidate(c)
-	}
-	return uniq, nil
+	s.store.PutCandidates(uniq) // single transaction
+	return uniq, len(errs) > 0, nil
 }
 
 func (s *Server) accByKey(key string) OSAccount {

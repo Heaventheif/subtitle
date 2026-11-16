@@ -5,9 +5,18 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"io"
 	"strings"
+	"unicode/utf16"
 	"unicode/utf8"
 )
+
+// cp1254Table: Turkish = cp1252 with 6 letters replaced.
+var cp1254Table = func() [256]rune {
+	t := cp1252Table
+	t[0xD0], t[0xDD], t[0xDE], t[0xF0], t[0xFD], t[0xFE] = 'Ğ', 'İ', 'Ş', 'ğ', 'ı', 'ş'
+	return t
+}()
 
 var fmtPref = map[string]int{"srt": 0, "vtt": 1, "ass": 2, "ssa": 3}
 
@@ -51,7 +60,7 @@ func ExtractSubtitle(data []byte) ([]byte, string, error) {
 				best = c
 			}
 		}
-		return best.content, best.name[strings.LastIndex(best.name, ".")+1:], nil
+		return best.content, strings.ToLower(best.name[strings.LastIndex(best.name, ".")+1:]), nil
 	}
 	head := strings.ToLower(string(bytes.TrimLeft(data[:min(len(data), 400)], "\xef\xbb\xbf\xff\xfe\xfe\xff")))
 	if strings.HasPrefix(head, "webvtt") {
@@ -75,12 +84,24 @@ func readZipFile(f *zip.File) ([]byte, error) {
 		return nil, err
 	}
 	defer rc.Close()
+	// guard against zip bombs: never inflate more than maxSubtitleBytes
+	if f.UncompressedSize64 > maxSubtitleBytes {
+		return nil, errTooLarge
+	}
 	var buf bytes.Buffer
-	if _, err := buf.ReadFrom(rc); err != nil {
+	if _, err := buf.ReadFrom(io.LimitReader(rc, maxSubtitleBytes+1)); err != nil {
 		return nil, err
+	}
+	if buf.Len() > maxSubtitleBytes {
+		return nil, errTooLarge
 	}
 	return buf.Bytes(), nil
 }
+
+const (
+	maxSubtitleBytes = 5 << 20
+	errTooLarge      = simpleErr("subtitle too large")
+)
 
 func min(a, b int) int {
 	if a < b {
@@ -125,18 +146,15 @@ func decodeUTF16(raw []byte) string {
 	if len(body)%2 != 0 {
 		body = body[:len(body)-1]
 	}
-	var b strings.Builder
-	b.Grow(len(body) / 2)
+	units := make([]uint16, 0, len(body)/2)
 	for i := 0; i < len(body); i += 2 {
-		var u uint16
 		if be {
-			u = uint16(body[i])<<8 | uint16(body[i+1])
+			units = append(units, uint16(body[i])<<8|uint16(body[i+1]))
 		} else {
-			u = uint16(body[i+1])<<8 | uint16(body[i])
+			units = append(units, uint16(body[i+1])<<8|uint16(body[i]))
 		}
-		b.WriteRune(rune(u))
 	}
-	return b.String()
+	return string(utf16.Decode(units)) // handles surrogate pairs
 }
 
 // DecodeText فك الترميز بذكاء: UTF-8 أولاً، ثم UTF-16 (BOM)، ثم cp1256/cp1252 للعربية.
@@ -150,7 +168,11 @@ func DecodeText(raw []byte, lang string) (string, string) {
 	if utf8.Valid(raw) {
 		return string(raw), "utf-8"
 	}
-	if strings.HasPrefix(strings.ToLower(lang), "ar") {
+	l := strings.ToLower(lang)
+	if strings.HasPrefix(l, "tr") {
+		return decodeSingleByte(raw, &cp1254Table), "windows-1254"
+	}
+	if strings.HasPrefix(l, "ar") || strings.HasPrefix(l, "fa") || strings.HasPrefix(l, "ur") {
 		bestRatio, bestText, bestEnc := 0.0, "", ""
 		for _, enc := range []struct {
 			name  string

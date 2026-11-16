@@ -41,7 +41,12 @@ func seRegex(key string) *regexp.Regexp {
 		}
 		rx = regexp.MustCompile(`(?i)` + se)
 	default: // "2x5"
-		rx = regexp.MustCompile(`(?i)\b0*` + key + `\b`)
+		// "2x5" → also matches zero-padded "2x05"
+		if i := strings.Index(key, "x"); i >= 0 {
+			rx = regexp.MustCompile(`(?i)\b0*` + key[:i] + `x0*` + key[i+1:] + `\b`)
+		} else {
+			rx = regexp.MustCompile(`(?i)\b0*` + key + `\b`)
+		}
 	}
 	seRxMu.Lock()
 	if len(seRxCache) > 2048 {

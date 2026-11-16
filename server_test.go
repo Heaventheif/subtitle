@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -45,7 +46,7 @@ func mockProviders(t *testing.T) (*httptest.Server, *map[string]int) {
 	mux.HandleFunc("/api/v1/subtitles", func(w http.ResponseWriter, r *http.Request) {
 		key := r.Header.Get("Api-Key")
 		atomic.AddInt64(&osNameCalls, 1)
-		(*counters)["os"] = int(atomic.LoadInt64(&osNameCalls))
+		setC(counters, "os", int(atomic.LoadInt64(&osNameCalls)))
 		if key == "oskey1" {
 			w.WriteHeader(http.StatusTooManyRequests)
 			json.NewEncoder(w).Encode(map[string]string{"error": "daily limit"})
@@ -54,7 +55,7 @@ func mockProviders(t *testing.T) (*httptest.Server, *map[string]int) {
 		q := r.URL.Query()
 		if q.Get("moviehash") != "" {
 			atomic.AddInt64(&osHashCalls, 1)
-			(*counters)["os_hash"] = int(atomic.LoadInt64(&osHashCalls))
+			setC(counters, "os_hash", int(atomic.LoadInt64(&osHashCalls)))
 			data := []map[string]any{{"attributes": map[string]any{
 				"language": "arabic", "release": "Movie.Name.2021.1080p.BluRay.x264-GRP",
 				"files":          []map[string]any{{"file_id": 111, "file_name": "Movie.Name.2021.srt"}},
@@ -97,7 +98,7 @@ func mockProviders(t *testing.T) (*httptest.Server, *map[string]int) {
 	})
 	mux.HandleFunc("/subdl/api/v1/subtitles", func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&subdlCalls, 1)
-		(*counters)["subdl"] = int(atomic.LoadInt64(&subdlCalls))
+		setC(counters, "subdl", int(atomic.LoadInt64(&subdlCalls)))
 		fn := r.URL.Query().Get("film_name")
 		if strings.Contains(fn, "Unknown") || strings.Contains(fn, "ZZZ") {
 			json.NewEncoder(w).Encode(map[string]any{"status": true, "subtitles": []any{}})
@@ -111,7 +112,7 @@ func mockProviders(t *testing.T) (*httptest.Server, *map[string]int) {
 	var srvURL string
 	mux.HandleFunc("/dl/", func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&fileFetches, 1)
-		(*counters)["files"] = int(atomic.LoadInt64(&fileFetches))
+		setC(counters, "files", int(atomic.LoadInt64(&fileFetches)))
 		if strings.HasPrefix(r.URL.Path, "/dl/os_111") {
 			w.Write(arBytes)
 			return
@@ -126,7 +127,7 @@ func mockProviders(t *testing.T) (*httptest.Server, *map[string]int) {
 
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	(*counters)["base"] = 0
+	setC(counters, "base", 0)
 	// نضع العنوان داخل متغير عام لاستخدامه في /api/v1/download
 	base.Store(srv.URL)
 	return srv, counters
@@ -272,7 +273,7 @@ func TestFullSearchHashFirst(t *testing.T) {
 		prev = m
 	}
 	// تدوير المفاتيح بعد 429 (oskey1 → oskey2) — كلاهما استُخدم
-	if (*counters)["os"] == 0 {
+	if getC(counters, "os") == 0 {
 		t.Fatal("os mock not called")
 	}
 }
@@ -313,13 +314,13 @@ func TestFileDownloadAndBlobCache(t *testing.T) {
 		t.Fatalf("body = %q", body)
 	}
 	// المرة الثانية من كاش blob — بلا مراجعة المزوّد
-	(*counters)["files"] = 0
+	setC(counters, "files", 0)
 	code, _, body2 := getRaw(t, srv.URL+"/file/"+fmt.Sprint(top["id"]), appToken)
 	if code != 200 || !strings.Contains(string(body2), "مرحبا") {
 		t.Fatalf("second fetch: code=%d", code)
 	}
-	if (*counters)["files"] != 0 {
-		t.Fatalf("provider re-fetched: %d times", (*counters)["files"])
+	if getC(counters, "files") != 0 {
+		t.Fatalf("provider re-fetched: %d times", getC(counters, "files"))
 	}
 }
 
@@ -441,3 +442,8 @@ func TestHotCacheIsolation(t *testing.T) {
 		t.Fatal("hot cache entry mutated from returned copy")
 	}
 }
+
+var cmu sync.Mutex
+
+func setC(m *map[string]int, k string, v int) { cmu.Lock(); (*m)[k] = v; cmu.Unlock() }
+func getC(m *map[string]int, k string) int    { cmu.Lock(); defer cmu.Unlock(); return (*m)[k] }
